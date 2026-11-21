@@ -8,10 +8,11 @@ import uuid
 from datetime import date, datetime
 from pathlib import Path
 
-from PySide6.QtCore import QStandardPaths, QTime, QTimer, Qt, Signal
+from PySide6.QtCore import QLockFile, QStandardPaths, QTime, QTimer, Qt, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QCheckBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -219,6 +220,12 @@ class PetWidget(QWidget):
         self.dog_style.currentIndexChanged.connect(self.save_dog_style)
         layout.addWidget(self.dog_style)
 
+        self.startup_toggle = QCheckBox("Start Wilson when I sign into Windows")
+        self.startup_toggle.setVisible(self.is_packaged_windows())
+        self.startup_toggle.setChecked(bool(self.state.get("start_with_windows", True)))
+        self.startup_toggle.toggled.connect(self.save_startup_setting)
+        layout.addWidget(self.startup_toggle)
+
         layout.addWidget(self.section_label("Today's tasks"))
         add_row = QHBoxLayout()
         self.task_input = QLineEdit()
@@ -253,6 +260,7 @@ class PetWidget(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(self.card)
 
+        self.apply_startup_setting()
         self.render_tasks()
         self.refresh_view()
         self.save_state()
@@ -278,6 +286,9 @@ class PetWidget(QWidget):
             "mood": 100.0,
             "mood_updated_at": datetime.now().isoformat(),
             "mood_frozen": False,
+            "start_with_windows": bool(
+                sys.platform == "win32" and getattr(sys, "frozen", False)
+            ),
         }
 
     def load_state(self) -> dict:
@@ -475,6 +486,44 @@ class PetWidget(QWidget):
         self.refresh_view()
         self.save_state()
 
+    @staticmethod
+    def is_packaged_windows() -> bool:
+        return sys.platform == "win32" and bool(getattr(sys, "frozen", False))
+
+    def save_startup_setting(self, enabled: bool) -> None:
+        self.state["start_with_windows"] = enabled
+        self.save_state()
+        self.apply_startup_setting()
+
+    def apply_startup_setting(self) -> None:
+        # Development runs never modify Windows startup settings.
+        if not self.is_packaged_windows():
+            return
+        try:
+            import winreg
+
+            run_key = r"Software\Microsoft\Windows\CurrentVersion\Run"
+            with winreg.CreateKeyEx(
+                winreg.HKEY_CURRENT_USER, run_key, 0, winreg.KEY_SET_VALUE
+            ) as key:
+                if self.state.get("start_with_windows", True):
+                    winreg.SetValueEx(
+                        key,
+                        "WilsonDogSelfHelp",
+                        0,
+                        winreg.REG_SZ,
+                        f'"{sys.executable}"',
+                    )
+                else:
+                    try:
+                        winreg.DeleteValue(key, "WilsonDogSelfHelp")
+                    except FileNotFoundError:
+                        pass
+        except OSError:
+            self.feedback.setText(
+                "Windows couldn't update the sign-in startup setting."
+            )
+
     def closeEvent(self, event) -> None:
         self.update_mood()
         self.save_state()
@@ -485,6 +534,20 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setOrganizationName("WilsonDogSelfHelp")
     app.setApplicationName("Wilson")
+
+    app_data = Path(QStandardPaths.writableLocation(
+        QStandardPaths.StandardLocation.AppDataLocation
+    ))
+    app_data.mkdir(parents=True, exist_ok=True)
+    instance_lock = QLockFile(str(app_data / "instance.lock"))
+    if not instance_lock.tryLock(0):
+        QMessageBox.information(
+            None,
+            "Wilson is already running",
+            "Only one copy of Wilson can run at a time.",
+        )
+        sys.exit(0)
+
     widget = PetWidget()
     widget.move(80, 100)
     widget.show()

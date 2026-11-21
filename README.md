@@ -22,6 +22,18 @@ Run the widget whenever you like:
 
 Run these commands from the repository folder. The widget stays above other windows and can be dragged by its title bar.
 
+## Build the Windows executable
+
+Build the single-file, windowed executable:
+
+```powershell
+.\build.ps1
+```
+
+The script creates a separate `.build-venv`, installs the build requirements, and creates `dist\WilsonDogSelfHelp.exe`. Run the executable once to enable launch when you sign in to Windows. The packaged app has a **Start Wilson when I sign into Windows** setting you can turn off. Running `app.py` during development does not change startup settings.
+
+Wilson uses a per-user Windows startup entry and a lock file in its app-data folder, so it starts for your account and prevents a second copy from opening.
+
 ## Prototype features
 
 - Add your own daily tasks and choose a deadline time for each one.
