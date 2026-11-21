@@ -2,17 +2,29 @@
 
 Wilson is a self-care Windows widget that gamifies completion of user-set tasks into a pet caring experience.
 
-## Daily Dog prototype
+## Run on Windows
 
-A tiny desktop pet prototype built with Python and PySide6. It stays above other windows, can be dragged, and reacts to three sample daily goals.
-
-### Run on Windows
+Install dependencies once:
 
 ```powershell
 py -m venv .venv
-.\.venv\Scripts\Activate.ps1
-py -m pip install -r requirements.txt
-py app.py
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-The goals and checked state are currently sample data and reset whenever the app closes. This first version is meant to test the daily interaction and pet feedback before adding persistence, reminders, or packaging.
+Run the widget whenever you like:
+
+```powershell
+.\.venv\Scripts\python.exe app.py
+```
+
+Run these commands from the repository folder. The widget stays above other windows and can be dragged by its title bar.
+
+## Prototype features
+
+- Add your own daily tasks and choose a deadline time for each one.
+- Confirm a task before it is marked complete. Completed tasks are crossed out and cannot be completed again that day.
+- The dog's mood slowly fades during the day. Finishing tasks raises it; finishing all tasks sets it to 100% until the next day.
+- Choose the dog's name, temperament, and emoji style.
+- Settings, tasks, deadlines, and mood are saved locally. Task completion and mood reset each new day.
+
+The temperament choices currently use placeholder lines. Custom sprite art and richer dialogue can be added later.
