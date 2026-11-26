@@ -41,7 +41,8 @@ Wilson uses a per-user Windows startup entry and a Windows mutex for single-inst
 - Add your own daily tasks and give each one a time limit (in minutes). A countdown shows how long is left, and the task is flagged as overdue once time runs out.
 - Confirm a task before it is marked complete. Completed tasks are crossed out and cannot be completed again that day.
 - The dog's mood slowly fades during the day. Finishing tasks raises it; finishing all tasks sets it to 100% until the next day.
-- Choose the dog's name, temperament, and emoji style.
+- Open **Settings** (below the task list) to choose the dog's name, temperament, and icon, and the Windows sign-in startup option.
+- Resize the widget by dragging its bottom-right corner; the size is remembered.
 - Minimize the widget down to its title bar with the – button, and expand it again with +.
 - Switch between light and dark mode with the ☾ / ☀ button.
 - Settings, tasks, time limits, and mood are saved locally. Task completion, task countdowns, and mood reset each new day.

@@ -24,7 +24,9 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSizeGrip,
     QSpinBox,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -33,6 +35,11 @@ from PySide6.QtWidgets import (
 MOOD_DECAY_PER_HOUR = 2.0
 ERROR_ALREADY_EXISTS = 183
 DEFAULT_TASK_MINUTES = 60
+MIN_WIDTH = 340
+DEFAULT_WIDTH = 390
+DEFAULT_HEIGHT = 560
+TASKS_PAGE = 0
+SETTINGS_PAGE = 1
 
 
 def acquire_instance_mutex():
@@ -231,7 +238,14 @@ class PetWidget(QWidget):
             | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setFixedWidth(390)
+        self.setMinimumWidth(MIN_WIDTH)
+        # True while the code (not the user) is resizing the window.
+        self._fitting = False
+        # Saving the size is debounced so dragging the grip doesn't hammer the disk.
+        self.size_save_timer = QTimer(self)
+        self.size_save_timer.setSingleShot(True)
+        self.size_save_timer.setInterval(400)
+        self.size_save_timer.timeout.connect(self.save_state)
 
         app_data = QStandardPaths.writableLocation(
             QStandardPaths.StandardLocation.AppDataLocation
@@ -278,7 +292,7 @@ class PetWidget(QWidget):
         body_layout = QVBoxLayout(self.body)
         body_layout.setContentsMargins(0, 0, 0, 0)
         body_layout.setSpacing(9)
-        layout.addWidget(self.body)
+        layout.addWidget(self.body, 1)
 
         pet_row = QHBoxLayout()
         self.pet = QLabel()
@@ -302,38 +316,44 @@ class PetWidget(QWidget):
         self.mood_bar.setTextVisible(False)
         body_layout.addWidget(self.mood_bar)
 
-        body_layout.addWidget(self.section_label("Personalize your dog"))
-        settings_row = QHBoxLayout()
-        self.name_input = QLineEdit(self.state["name"])
-        self.name_input.setPlaceholderText("Dog's name")
-        self.name_input.setMaxLength(24)
-        self.name_input.editingFinished.connect(self.save_name)
-        settings_row.addWidget(self.name_input, 1)
+        # The area below the mood bar switches between the task list and settings.
+        self.pages = QStackedWidget()
+        self.pages.addWidget(self.build_tasks_page())
+        self.pages.addWidget(self.build_settings_page())
+        body_layout.addWidget(self.pages, 1)
 
-        self.temperament = QComboBox()
-        self.temperament.addItems(["Kind", "Sassy", "Asshole"])
-        self.temperament.setCurrentText(self.state["temperament"])
-        self.temperament.currentTextChanged.connect(self.save_temperament)
-        settings_row.addWidget(self.temperament)
-        body_layout.addLayout(settings_row)
+        self.feedback = QLabel("")
+        self.feedback.setObjectName("status")
+        body_layout.addWidget(self.feedback)
+        self.confirm_dialog = None
 
-        self.dog_style = QComboBox()
-        self.dog_style.addItem("Classic dog", "\U0001F436")
-        self.dog_style.addItem("Dog", "\U0001F415")
-        self.dog_style.addItem("Poodle", "\U0001F429")
-        self.dog_style.addItem("Guide dog", "\U0001F9AE")
-        style_index = self.dog_style.findData(self.state["dog_style"])
-        self.dog_style.setCurrentIndex(max(style_index, 0))
-        self.dog_style.currentIndexChanged.connect(self.save_dog_style)
-        body_layout.addWidget(self.dog_style)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(self.card)
 
-        self.startup_toggle = QCheckBox("Start Wilson when I sign into Windows")
-        self.startup_toggle.setVisible(self.is_packaged_windows())
-        self.startup_toggle.setChecked(bool(self.state.get("start_with_windows", True)))
-        self.startup_toggle.toggled.connect(self.save_startup_setting)
-        body_layout.addWidget(self.startup_toggle)
+        # Drag the bottom-right corner to resize the widget.
+        self.size_grip = QSizeGrip(self)
+        self.size_grip.setToolTip("Drag to resize")
 
-        body_layout.addWidget(self.section_label("Today's tasks"))
+        self.apply_theme()
+        self.apply_collapsed()
+        self.fit_window_to_state()
+        self.apply_startup_setting()
+        self.render_tasks()
+        self.refresh_view()
+        self.save_state()
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.tick)
+        self.timer.start(30_000)
+
+    def build_tasks_page(self) -> QWidget:
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        page_layout.setSpacing(9)
+
+        page_layout.addWidget(self.section_label("Today's tasks"))
         add_row = QHBoxLayout()
         self.task_input = QLineEdit()
         self.task_input.setPlaceholderText("What do you want to do?")
@@ -349,7 +369,7 @@ class PetWidget(QWidget):
         add_button = QPushButton("Add")
         add_button.clicked.connect(self.add_task)
         add_row.addWidget(add_button)
-        body_layout.addLayout(add_row)
+        page_layout.addLayout(add_row)
 
         self.task_list = QWidget()
         self.task_list_layout = QVBoxLayout(self.task_list)
@@ -358,34 +378,80 @@ class PetWidget(QWidget):
         self.task_rows: dict[str, TaskRow] = {}
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
-        self.scroll.setMaximumHeight(230)
+        # The list grows and shrinks with the window instead of a fixed height.
+        self.scroll.setMinimumHeight(90)
         self.scroll.setWidget(self.task_list)
-        body_layout.addWidget(self.scroll)
+        page_layout.addWidget(self.scroll, 1)
 
-        self.feedback = QLabel("")
-        self.feedback.setObjectName("status")
-        body_layout.addWidget(self.feedback)
-        self.confirm_dialog = None
+        settings_button = QPushButton("⚙  Settings")
+        settings_button.setObjectName("secondaryButton")
+        settings_button.clicked.connect(lambda _checked=False: self.show_page(SETTINGS_PAGE))
+        page_layout.addWidget(settings_button)
+        return page
 
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(self.card)
+    def build_settings_page(self) -> QWidget:
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        page_layout.setSpacing(6)
 
-        self.apply_theme()
-        self.apply_collapsed()
-        self.apply_startup_setting()
-        self.render_tasks()
-        self.refresh_view()
-        self.save_state()
+        header = QHBoxLayout()
+        header.addWidget(self.section_label("Settings"))
+        header.addStretch()
+        back_button = QPushButton("Back")
+        back_button.setObjectName("secondaryButton")
+        back_button.clicked.connect(lambda _checked=False: self.show_page(TASKS_PAGE))
+        header.addWidget(back_button)
+        page_layout.addLayout(header)
 
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.tick)
-        self.timer.start(30_000)
+        page_layout.addWidget(self.field_label("Dog's name"))
+        self.name_input = QLineEdit(self.state["name"])
+        self.name_input.setPlaceholderText("Dog's name")
+        self.name_input.setMaxLength(24)
+        self.name_input.editingFinished.connect(self.save_name)
+        page_layout.addWidget(self.name_input)
+
+        page_layout.addWidget(self.field_label("Dog's temperament"))
+        self.temperament = QComboBox()
+        self.temperament.addItems(list(TEMPERAMENT_MESSAGES))
+        self.temperament.setCurrentText(self.state["temperament"])
+        self.temperament.currentTextChanged.connect(self.save_temperament)
+        page_layout.addWidget(self.temperament)
+
+        page_layout.addWidget(self.field_label("Dog's icon"))
+        self.dog_style = QComboBox()
+        self.dog_style.addItem("\U0001F436  Classic dog", "\U0001F436")
+        self.dog_style.addItem("\U0001F415  Dog", "\U0001F415")
+        self.dog_style.addItem("\U0001F429  Poodle", "\U0001F429")
+        self.dog_style.addItem("\U0001F9AE  Guide dog", "\U0001F9AE")
+        style_index = self.dog_style.findData(self.state["dog_style"])
+        self.dog_style.setCurrentIndex(max(style_index, 0))
+        self.dog_style.currentIndexChanged.connect(self.save_dog_style)
+        page_layout.addWidget(self.dog_style)
+
+        self.startup_toggle = QCheckBox("Start Wilson when I sign into Windows")
+        self.startup_toggle.setVisible(self.is_packaged_windows())
+        self.startup_toggle.setChecked(bool(self.state.get("start_with_windows", True)))
+        self.startup_toggle.toggled.connect(self.save_startup_setting)
+        page_layout.addSpacing(4)
+        page_layout.addWidget(self.startup_toggle)
+
+        page_layout.addStretch(1)
+        return page
+
+    def show_page(self, index: int) -> None:
+        self.pages.setCurrentIndex(index)
 
     @staticmethod
     def section_label(text: str) -> QLabel:
         label = QLabel(text)
         label.setStyleSheet("font-weight: 700; margin-top: 3px;")
+        return label
+
+    @staticmethod
+    def field_label(text: str) -> QLabel:
+        label = QLabel(text)
+        label.setObjectName("status")
         return label
 
     @staticmethod
@@ -401,6 +467,7 @@ class PetWidget(QWidget):
             "mood_frozen": False,
             "theme": "light",
             "collapsed": False,
+            "size": [DEFAULT_WIDTH, DEFAULT_HEIGHT],
             "start_with_windows": bool(
                 sys.platform == "win32" and getattr(sys, "frozen", False)
             ),
@@ -426,6 +493,12 @@ class PetWidget(QWidget):
         if state.get("theme") not in THEMES:
             state["theme"] = "light"
         state["collapsed"] = bool(state.get("collapsed", False))
+        size = state.get("size")
+        if not (
+            isinstance(size, list) and len(size) == 2
+            and all(isinstance(value, int) and value > 0 for value in size)
+        ):
+            state["size"] = [DEFAULT_WIDTH, DEFAULT_HEIGHT]
         if not isinstance(state.get("tasks"), list):
             state["tasks"] = []
         state["tasks"] = [
@@ -724,11 +797,39 @@ class PetWidget(QWidget):
 
     def apply_collapsed(self) -> None:
         collapsed = self.state["collapsed"]
+        # Ignore the layout's own resizes while switching, so the saved size survives.
+        self._fitting = True
         self.body.setVisible(not collapsed)
         self.minimize_button.setText("+" if collapsed else "–")
         self.minimize_button.setToolTip("Expand" if collapsed else "Minimize")
-        # Let the layout settle, then shrink or grow the window to fit.
-        QTimer.singleShot(0, self.adjustSize)
+        if hasattr(self, "size_grip"):
+            self.size_grip.setVisible(not collapsed)
+        # Let the layout settle, then shrink to the title bar or restore the saved size.
+        QTimer.singleShot(0, self.fit_window_to_state)
+
+    def fit_window_to_state(self) -> None:
+        self._fitting = True
+        self.layout().activate()
+        width, height = self.state["size"]
+        width = max(width, MIN_WIDTH)
+        if self.state["collapsed"]:
+            height = self.minimumSizeHint().height()
+        else:
+            height = max(height, self.minimumSizeHint().height())
+        self.resize(width, height)
+        self._fitting = False
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        grip = getattr(self, "size_grip", None)
+        if grip is None:
+            return
+        grip.move(self.width() - grip.width() - 6, self.height() - grip.height() - 6)
+        grip.raise_()
+        # Only remember sizes the user chose while the widget is expanded.
+        if not self._fitting and not self.state["collapsed"]:
+            self.state["size"] = [self.width(), self.height()]
+            self.size_save_timer.start()
 
     @staticmethod
     def is_packaged_windows() -> bool:
