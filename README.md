@@ -20,7 +20,7 @@ Run the widget whenever you like:
 .\.venv\Scripts\python.exe app.py
 ```
 
-Run these commands from the repository folder. The widget stays above other windows and can be dragged by its title bar.
+Run these commands from the repository folder. The widget stays above other windows and can be dragged by its title bar. It hides itself while another app fills the screen (such as a fullscreen game) and comes back when you return to the desktop or a normal window.
 
 ## Build the Windows app
 
@@ -49,7 +49,8 @@ Wilson uses a per-user Windows startup entry and a Windows mutex for single-inst
 - Confirm a task before it is marked complete. Completed tasks are crossed out and cannot be completed again that day.
 - The dog's mood slowly fades during the day. Finishing tasks raises it; finishing all tasks sets it to 100% until the next day.
 - Open **Settings** (below the task list) to choose the dog's name, temperament, and icon, and the Windows sign-in startup option.
-- Resize the widget by dragging its bottom-right corner; the size is remembered.
+- Resize the widget by dragging its bottom-right corner; the size is remembered. Make it wider than it is tall and it switches to a landscape layout, with the dog and mood in a column beside the tasks.
+- Remove a task with the red ✕ next to it.
 - Minimize the widget down to its title bar with the – button, and expand it again with +.
 - Switch between light and dark mode with the ☾ / ☀ button.
 - Settings, tasks, time limits, and mood are saved locally. Task completion, task countdowns, and mood reset each new day.

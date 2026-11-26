@@ -15,6 +15,7 @@ from PySide6.QtCore import QDate, QDateTime, QStandardPaths, QTime, QTimer, Qt, 
 from PySide6.QtGui import QColor, QIcon, QTextCharFormat
 from PySide6.QtWidgets import (
     QApplication,
+    QBoxLayout,
     QButtonGroup,
     QCalendarWidget,
     QComboBox,
@@ -81,6 +82,55 @@ def acquire_instance_mutex():
         kernel32.CloseHandle(handle)
         return None
     return kernel32, handle
+
+LANDSCAPE_RATIO = 1.2  # Wider than this (width / height) switches to the side-by-side layout.
+QWIDGETSIZE_MAX = 16777215
+
+
+class MONITORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", wintypes.RECT),
+        ("rcWork", wintypes.RECT),
+        ("dwFlags", wintypes.DWORD),
+    ]
+
+
+# Windows' desktop and wallpaper windows also cover the whole screen, so ignore them.
+DESKTOP_WINDOW_CLASSES = {"Progman", "WorkerW"}
+
+
+def foreground_is_fullscreen(own_hwnd: int) -> bool:
+    """True when another app's window fills its whole monitor, such as a fullscreen game."""
+    if sys.platform != "win32":
+        return False
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.MonitorFromWindow.argtypes = (wintypes.HWND, wintypes.DWORD)
+    user32.MonitorFromWindow.restype = wintypes.HMONITOR
+
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd or hwnd == own_hwnd:
+        return False
+    class_name = ctypes.create_unicode_buffer(256)
+    user32.GetClassNameW(hwnd, class_name, 256)
+    if class_name.value in DESKTOP_WINDOW_CLASSES:
+        return False
+
+    window = wintypes.RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(window)):
+        return False
+    monitor = user32.MonitorFromWindow(hwnd, 2)  # MONITOR_DEFAULTTONEAREST
+    info = MONITORINFO()
+    info.cbSize = ctypes.sizeof(MONITORINFO)
+    if not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+        return False
+    screen = info.rcMonitor
+    return (
+        window.left <= screen.left and window.top <= screen.top
+        and window.right >= screen.right and window.bottom >= screen.bottom
+    )
+
 
 TEMPERAMENT_MESSAGES = {
     "Kind": {
@@ -165,6 +215,9 @@ def build_stylesheet(p: dict) -> str:
         QPushButton:disabled {{ background: {p['disabled']}; color: {p['disabled_text']}; }}
         QPushButton#secondaryButton {{ background: {p['secondary']};
                                       color: {p['secondary_text']}; }}
+        QPushButton#removeButton {{ background: {p['secondary']}; color: {p['overdue']};
+                                   font-weight: 700; padding: 7px 0; }}
+        QPushButton#removeButton:hover {{ background: {p['border']}; }}
         QMessageBox {{ background: {p['card']}; color: {p['text']}; }}
         QMessageBox QLabel {{ background: transparent; color: {p['text']}; }}
         QMessageBox QPushButton {{ background: {p['accent']}; color: {p['accent_text']};
@@ -351,8 +404,10 @@ class TaskRow(QFrame):
         )
         row.addWidget(self.complete_button)
 
-        remove_button = QPushButton("Remove")
-        remove_button.setObjectName("secondaryButton")
+        remove_button = QPushButton("✕")
+        remove_button.setObjectName("removeButton")
+        remove_button.setToolTip("Remove task")
+        remove_button.setFixedWidth(30)
         remove_button.clicked.connect(
             lambda _checked=False: self.remove_requested.emit(self.task_id)
         )
@@ -440,45 +495,64 @@ class PetWidget(QWidget):
         layout.addWidget(title_bar)
 
         # Everything below the title bar lives in the body so it can be collapsed.
+        # The body is portrait (panels stacked) or landscape (side by side); see apply_orientation.
         self.body = QWidget()
-        body_layout = QVBoxLayout(self.body)
+        body_layout = QBoxLayout(QBoxLayout.Direction.TopToBottom, self.body)
         body_layout.setContentsMargins(0, 0, 0, 0)
         body_layout.setSpacing(9)
+        self.body_layout = body_layout
         layout.addWidget(self.body, 1)
 
-        pet_row = QHBoxLayout()
+        # Dog, message and mood: the left column in landscape, the top in portrait.
+        self.top_panel = QWidget()
+        top_layout = QVBoxLayout(self.top_panel)
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.setSpacing(9)
+
+        self.pet_row = QBoxLayout(QBoxLayout.Direction.LeftToRight)
         self.pet = QLabel()
         self.pet.setObjectName("pet")
         self.pet.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        pet_row.addWidget(self.pet)
+        self.pet_row.addWidget(self.pet)
         self.mood_message = QLabel()
         self.mood_message.setObjectName("status")
         self.mood_message.setWordWrap(True)
-        pet_row.addWidget(self.mood_message, 1)
-        body_layout.addLayout(pet_row)
+        self.pet_row.addWidget(self.mood_message, 1)
+        top_layout.addLayout(self.pet_row)
 
         mood_header = QHBoxLayout()
         mood_header.addWidget(QLabel("Mood"))
         mood_header.addStretch()
         self.mood_value = QLabel()
         mood_header.addWidget(self.mood_value)
-        body_layout.addLayout(mood_header)
+        top_layout.addLayout(mood_header)
         self.mood_bar = QProgressBar()
         self.mood_bar.setRange(0, 100)
         self.mood_bar.setTextVisible(False)
-        body_layout.addWidget(self.mood_bar)
+        top_layout.addWidget(self.mood_bar)
+        # Keeps the dog and mood packed at the top of the column in landscape.
+        top_layout.addStretch(1)
 
-        # The area below the mood bar switches between the task list and settings.
+        # Tasks, settings and calendar, plus feedback, fill the rest of the widget.
+        self.right_panel = QWidget()
+        right_layout = QVBoxLayout(self.right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(9)
+        # The area switches between the task list, settings and calendar.
         self.pages = QStackedWidget()
         self.pages.addWidget(self.build_tasks_page())
         self.pages.addWidget(self.build_settings_page())
         self.pages.addWidget(self.build_calendar_page())
-        body_layout.addWidget(self.pages, 1)
+        right_layout.addWidget(self.pages, 1)
 
         self.feedback = QLabel("")
         self.feedback.setObjectName("status")
-        body_layout.addWidget(self.feedback)
+        right_layout.addWidget(self.feedback)
         self.confirm_dialog = None
+
+        body_layout.addWidget(self.top_panel)
+        body_layout.addWidget(self.right_panel, 1)
+        self.apply_orientation()
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -499,6 +573,37 @@ class PetWidget(QWidget):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
         self.timer.start(30_000)
+
+        # Hide the widget while another app fills the screen (e.g. a game), show it again after.
+        self._hidden_for_fullscreen = False
+        self.fullscreen_timer = QTimer(self)
+        self.fullscreen_timer.timeout.connect(self.check_fullscreen)
+        self.fullscreen_timer.start(1000)
+
+    def check_fullscreen(self) -> None:
+        fullscreen = foreground_is_fullscreen(int(self.winId()))
+        if fullscreen and self.isVisible():
+            self._hidden_for_fullscreen = True
+            self.hide()
+        elif not fullscreen and self._hidden_for_fullscreen:
+            self._hidden_for_fullscreen = False
+            self.show()
+
+    def apply_orientation(self) -> None:
+        """Side by side when the widget is wider than it is tall, stacked otherwise."""
+        landscape = self.width() >= LANDSCAPE_RATIO * self.height()
+        if landscape == getattr(self, "_landscape", None):
+            return
+        self._landscape = landscape
+        self.body_layout.setDirection(
+            QBoxLayout.Direction.LeftToRight if landscape else QBoxLayout.Direction.TopToBottom
+        )
+        self.pet_row.setDirection(
+            QBoxLayout.Direction.TopToBottom if landscape else QBoxLayout.Direction.LeftToRight
+        )
+        self.top_panel.setMaximumWidth(170 if landscape else QWIDGETSIZE_MAX)
+        self.body_layout.setStretch(self.body_layout.indexOf(self.top_panel), 0)
+        self.body_layout.setStretch(self.body_layout.indexOf(self.right_panel), 1)
 
     def build_tasks_page(self) -> QWidget:
         page = QWidget()
@@ -1327,6 +1432,8 @@ class PetWidget(QWidget):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        if hasattr(self, "body_layout"):
+            self.apply_orientation()
         grip = getattr(self, "size_grip", None)
         if grip is None:
             return
