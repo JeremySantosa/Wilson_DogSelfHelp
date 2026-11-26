@@ -12,7 +12,7 @@ from pathlib import Path
 from ctypes import wintypes
 
 from PySide6.QtCore import QDate, QDateTime, QStandardPaths, QTime, QTimer, Qt, Signal
-from PySide6.QtGui import QColor, QTextCharFormat
+from PySide6.QtGui import QColor, QIcon, QTextCharFormat
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QStackedWidget,
     QTimeEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -54,7 +55,11 @@ DEFAULT_END_TIME = "23:55"
 KIND_COUNTDOWN = "countdown"
 KIND_TIME = "time"
 KIND_DATE = "date"
-TASK_KINDS = (KIND_COUNTDOWN, KIND_TIME, KIND_DATE)
+KIND_WEEKLY = "weekly"
+TASK_KINDS = (KIND_COUNTDOWN, KIND_TIME, KIND_DATE, KIND_WEEKLY)
+# Kinds whose due time is a fixed moment, so they can sit under "Upcoming".
+SCHEDULED_KINDS = (KIND_DATE, KIND_WEEKLY)
+WEEKDAY_NAMES = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
 
 def acquire_instance_mutex():
@@ -143,7 +148,7 @@ def build_stylesheet(p: dict) -> str:
         QCalendarWidget QSpinBox {{ padding: 2px; }}
         QCalendarWidget QAbstractItemView {{
             background: {p['input']}; color: {p['text']}; outline: 0;
-            selection-background-color: {p['accent']}; selection-color: {p['accent_text']};
+            selection-background-color: {p['text']}; selection-color: {p['card']};
         }}
         QCalendarWidget QAbstractItemView:disabled {{ color: {p['disabled_text']}; }}
         QComboBox QAbstractItemView {{
@@ -195,6 +200,36 @@ def next_occurrence(end_time: str, now: datetime | None = None) -> datetime:
     return due
 
 
+def next_weekly_due(
+    weekdays: list[int], end_time: str, now: datetime | None = None,
+    allow_passed_today: bool = False,
+) -> datetime:
+    """The next selected weekday at end_time. Today counts if the time hasn't
+    passed yet, or always when allow_passed_today (used by the daily reset)."""
+    now = now or datetime.now()
+    clock = datetime.strptime(end_time, "%H:%M").time()
+    for offset in range(8):
+        day = now.date() + timedelta(days=offset)
+        if day.weekday() not in weekdays:
+            continue
+        due = datetime.combine(day, clock)
+        if offset == 0 and due <= now and not allow_passed_today:
+            continue
+        return due
+    raise ValueError("A weekly task needs at least one weekday.")
+
+
+def weekdays_text(weekdays: list[int]) -> str:
+    days = sorted(set(weekdays))
+    if days == list(range(7)):
+        return "Every day"
+    if days == list(range(5)):
+        return "Weekdays"
+    if days == [5, 6]:
+        return "Weekends"
+    return ", ".join(WEEKDAY_NAMES[day] for day in days)
+
+
 def task_due(task: dict) -> datetime | None:
     try:
         return datetime.fromisoformat(task["due_at"])
@@ -224,6 +259,14 @@ def time_left_text(task: dict) -> tuple[str, bool]:
         else:
             day = due.strftime("%a %d %b").replace(" 0", " ")
         when = f"Due {day}, {clock_text(due)}"
+    elif kind == KIND_WEEKLY:
+        when = weekdays_text(task.get("weekdays", []))
+        if due.date() <= today:
+            when += f" · by {clock_text(due)}"
+        elif due.date() == today + timedelta(days=1):
+            when += f" · tomorrow by {clock_text(due)}"
+        else:
+            when += f" · next {due.strftime('%a')} by {clock_text(due)}"
     else:
         when = f"{task.get('duration_minutes', DEFAULT_TASK_MINUTES)} min countdown"
 
@@ -267,11 +310,14 @@ class TaskRow(QFrame):
     complete_requested = Signal(str)
     remove_requested = Signal(str)
 
-    def __init__(self, task: dict, parent: QWidget | None = None) -> None:
+    def __init__(
+        self, task: dict, parent: QWidget | None = None, can_complete: bool = True
+    ) -> None:
         super().__init__(parent)
         self.task_id = task["id"]
         self.setObjectName("taskRow")
-        # Keep each row at its natural height so a long list scrolls instead of squashing.
+        # Keep each row at its natural height so a long list scrolls instead of
+        # squashing; resizeEvent grows it to fit wrapped text.
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
 
         row = QHBoxLayout(self)
@@ -297,7 +343,9 @@ class TaskRow(QFrame):
         self.update_time_left(task)
 
         self.complete_button = QPushButton("Complete")
-        self.complete_button.setEnabled(not task.get("done", False))
+        self.complete_button.setEnabled(can_complete and not task.get("done", False))
+        if not can_complete:
+            self.complete_button.setToolTip("You can complete this on its next scheduled day.")
         self.complete_button.clicked.connect(
             lambda _checked=False: self.complete_requested.emit(self.task_id)
         )
@@ -310,9 +358,21 @@ class TaskRow(QFrame):
         )
         row.addWidget(remove_button)
 
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.fit_height()
+
+    def fit_height(self) -> None:
+        """Make the row tall enough for its wrapped title and details at this width."""
+        needed = self.layout().heightForWidth(self.width())
+        if needed > 0 and needed != self.minimumHeight():
+            self.setMinimumHeight(needed)
+
     def update_time_left(self, task: dict) -> None:
         text, overdue = time_left_text(task)
         self.time_left.setText(text)
+        if self.isVisible():
+            self.fit_height()
         if self.time_left.property("overdue") != overdue:
             # Re-polish so the [overdue="true"] style rule is re-evaluated.
             self.time_left.setProperty("overdue", overdue)
@@ -460,7 +520,8 @@ class PetWidget(QWidget):
         kind_options = (
             (KIND_COUNTDOWN, "Countdown", "Finish within a set number of minutes. Repeats daily."),
             (KIND_TIME, "End by", "Finish by a time of day, e.g. 11:55 PM. Repeats daily."),
-            (KIND_DATE, "Due date", "A one-off task due on a date, even days away."),
+            (KIND_DATE, "Date", "A one-off task due on a date, even days away."),
+            (KIND_WEEKLY, "Weekly", "Repeats on the weekdays you pick, finishing by a set time."),
         )
         for index, (_kind, label, tip) in enumerate(kind_options):
             button = QPushButton(label)
@@ -471,6 +532,23 @@ class PetWidget(QWidget):
             kind_row.addWidget(button, 1)
         self.kind_buttons.idToggled.connect(self.on_kind_toggled)
         page_layout.addLayout(kind_row)
+
+        # Weekday toggles, only shown for weekly tasks.
+        self.weekday_row = QWidget()
+        weekday_layout = QHBoxLayout(self.weekday_row)
+        weekday_layout.setContentsMargins(0, 0, 0, 0)
+        weekday_layout.setSpacing(4)
+        self.weekday_buttons: list[QPushButton] = []
+        for index, name in enumerate(WEEKDAY_NAMES):
+            button = QPushButton(name[:2])
+            button.setObjectName("segment")
+            button.setCheckable(True)
+            button.setToolTip(name)
+            button.setMinimumWidth(0)
+            weekday_layout.addWidget(button, 1)
+            self.weekday_buttons.append(button)
+        self.weekday_row.setVisible(False)
+        page_layout.addWidget(self.weekday_row)
 
         add_row = QHBoxLayout()
         self.deadline_inputs = QStackedWidget()
@@ -552,7 +630,7 @@ class PetWidget(QWidget):
             QCalendarWidget.HorizontalHeaderFormat.ShortDayNames
         )
         self.calendar.setMinimumHeight(190)
-        self.calendar.selectionChanged.connect(self.render_calendar_day)
+        self.calendar.selectionChanged.connect(self.on_calendar_selection)
         page_layout.addWidget(self.calendar)
 
         self.calendar_day_label = QLabel()
@@ -632,8 +710,16 @@ class PetWidget(QWidget):
         self.pages.setCurrentIndex(index)
 
     def on_kind_toggled(self, index: int, checked: bool) -> None:
-        if checked:
-            self.deadline_inputs.setCurrentIndex(index)
+        if not checked:
+            return
+        kind = TASK_KINDS[index]
+        # Weekly tasks reuse the "end by" time box, plus the weekday toggles.
+        input_index = TASK_KINDS.index(KIND_TIME) if kind == KIND_WEEKLY else index
+        self.deadline_inputs.setCurrentIndex(input_index)
+        self.weekday_row.setVisible(kind == KIND_WEEKLY)
+
+    def selected_weekdays(self) -> list[int]:
+        return [day for day, button in enumerate(self.weekday_buttons) if button.isChecked()]
 
     def selected_kind(self) -> str:
         return TASK_KINDS[max(0, self.kind_buttons.checkedId())]
@@ -746,8 +832,16 @@ class PetWidget(QWidget):
                 task["end_time"] = old_deadline
             else:
                 task["kind"] = KIND_COUNTDOWN
-        if task["kind"] == KIND_TIME and not cls.valid_clock(task.get("end_time")):
+        if task["kind"] in (KIND_TIME, KIND_WEEKLY) and not cls.valid_clock(task.get("end_time")):
             task["kind"] = KIND_COUNTDOWN
+        if task["kind"] == KIND_WEEKLY:
+            weekdays = task.get("weekdays")
+            if isinstance(weekdays, list):
+                weekdays = sorted({day for day in weekdays if isinstance(day, int) and 0 <= day <= 6})
+            if not weekdays:
+                task["kind"] = KIND_COUNTDOWN
+            else:
+                task["weekdays"] = weekdays
         try:
             task["duration_minutes"] = max(1, int(task["duration_minutes"]))
         except (KeyError, TypeError, ValueError):
@@ -758,6 +852,8 @@ class PetWidget(QWidget):
         if task["kind"] == KIND_TIME:
             clock = datetime.strptime(task["end_time"], "%H:%M").time()
             due = datetime.combine(date.today(), clock)
+        elif task["kind"] == KIND_WEEKLY:
+            due = next_weekly_due(task["weekdays"], task["end_time"], allow_passed_today=True)
         else:
             # A dated task without a date can't be recovered; treat it as a countdown.
             task["kind"] = KIND_COUNTDOWN
@@ -766,8 +862,8 @@ class PetWidget(QWidget):
 
     @staticmethod
     def is_today_task(task: dict) -> bool:
-        """Daily tasks always count for today; dated tasks only once their day arrives."""
-        if task.get("kind") != KIND_DATE:
+        """Daily tasks always count for today; dated and weekly tasks only on their day."""
+        if task.get("kind") not in SCHEDULED_KINDS:
             return True
         due = task_due(task)
         return due is None or due.date() <= date.today()
@@ -803,8 +899,13 @@ class PetWidget(QWidget):
                     kept.append(task)
                 continue
             task["done"] = False
-            # Each new day restarts countdowns and moves "end by" times to today.
-            if task["kind"] == KIND_TIME:
+            # Each new day restarts countdowns, moves "end by" times to today,
+            # and moves weekly tasks to today (if it's one of their days) or their next day.
+            if task["kind"] == KIND_WEEKLY:
+                due = next_weekly_due(
+                    task["weekdays"], task["end_time"], now, allow_passed_today=True
+                )
+            elif task["kind"] == KIND_TIME:
                 clock = datetime.strptime(task["end_time"], "%H:%M").time()
                 due = datetime.combine(now.date(), clock)
             else:
@@ -872,7 +973,9 @@ class PetWidget(QWidget):
                 item.widget().deleteLater()
 
     def make_task_row(self, task: dict, parent: QWidget) -> TaskRow:
-        row = TaskRow(task, parent)
+        # A weekly task can't be ticked off before its day; it would just reset.
+        can_complete = task.get("kind") != KIND_WEEKLY or self.is_today_task(task)
+        row = TaskRow(task, parent, can_complete)
         row.complete_requested.connect(self.confirm_task)
         row.remove_requested.connect(self.remove_task)
         return row
@@ -881,6 +984,7 @@ class PetWidget(QWidget):
     def note_label(text: str, object_name: str = "status") -> QLabel:
         label = QLabel(text)
         label.setObjectName(object_name)
+        label.setTextFormat(Qt.TextFormat.PlainText)
         label.setWordWrap(True)
         return label
 
@@ -889,7 +993,10 @@ class PetWidget(QWidget):
         self.task_rows = {}
 
         today = self.today_tasks()
-        upcoming = [task for task in self.dated_tasks() if not self.is_today_task(task)]
+        upcoming = sorted(
+            (task for task in self.state["tasks"] if not self.is_today_task(task)),
+            key=lambda task: task["due_at"],
+        )
         if not today:
             self.task_list_layout.addWidget(
                 self.note_label("Add a task to start today's list.")
@@ -923,6 +1030,17 @@ class PetWidget(QWidget):
             mark.setBackground(QColor(palette["accent"] if has_pending else palette["good"]))
             mark.setForeground(QColor(palette["accent_text"]))
             self.calendar.setDateTextFormat(QDate(day.year, day.month, day.day), mark)
+        # Paint the selected day ourselves (inverted colours) so it always shows,
+        # even when the calendar's own selection highlight isn't drawn.
+        selected = QTextCharFormat()
+        selected.setFontWeight(700)
+        selected.setBackground(QColor(palette["text"]))
+        selected.setForeground(QColor(palette["card"]))
+        self.calendar.setDateTextFormat(self.calendar.selectedDate(), selected)
+
+    def on_calendar_selection(self) -> None:
+        self.refresh_calendar_marks()
+        self.render_calendar_day()
 
     def render_calendar_day(self) -> None:
         self.clear_layout(self.calendar_day_layout)
@@ -938,15 +1056,30 @@ class PetWidget(QWidget):
         self.calendar_day_label.setText(title)
 
         tasks = [task for task in self.dated_tasks() if task_due(task).date() == day]
-        if not tasks:
+        weekly = [
+            task for task in self.state["tasks"]
+            if task.get("kind") == KIND_WEEKLY and day.weekday() in task["weekdays"]
+        ]
+        if not tasks and not weekly:
             self.calendar_day_layout.addWidget(
-                self.note_label("No dated tasks this day. Countdown and "
+                self.note_label("Nothing scheduled this day. Countdown and "
                                 "end-by tasks repeat daily on the main list.")
             )
         for task in tasks:
             row = self.make_task_row(task, self.calendar_day_list)
             self.calendar_day_layout.addWidget(row)
             self.calendar_rows[task["id"]] = row
+        for task in weekly:
+            if task_due(task).date() == day:
+                # This is the task's current occurrence, so it can be completed here.
+                row = self.make_task_row(task, self.calendar_day_list)
+                self.calendar_day_layout.addWidget(row)
+                self.calendar_rows[task["id"]] = row
+            else:
+                clock = clock_text(datetime.strptime(task["end_time"], "%H:%M"))
+                self.calendar_day_layout.addWidget(self.note_label(
+                    f"↻  {task['title']}: weekly, by {clock}"
+                ))
         self.calendar_day_layout.addStretch(1)
         self.add_on_day_button.setEnabled(day >= today)
 
@@ -980,6 +1113,14 @@ class PetWidget(QWidget):
             if due <= now:
                 self.feedback.setText("Pick a due time that hasn't passed yet.")
                 return
+        elif kind == KIND_WEEKLY:
+            weekdays = self.selected_weekdays()
+            if not weekdays:
+                self.feedback.setText("Pick at least one day for a weekly task.")
+                return
+            task["weekdays"] = weekdays
+            task["end_time"] = self.end_time_input.time().toString("HH:mm")
+            due = next_weekly_due(weekdays, task["end_time"], now)
         else:
             due = now + timedelta(minutes=task["duration_minutes"])
         task["due_at"] = due.isoformat(timespec="seconds")
@@ -993,7 +1134,10 @@ class PetWidget(QWidget):
             self.feedback.clear()
         else:
             day = due.strftime("%a %d %b").replace(" 0", " ")
-            self.feedback.setText(f"Added to your calendar for {day}.")
+            if kind == KIND_WEEKLY:
+                self.feedback.setText(f"Weekly task added. Next one is {day}.")
+            else:
+                self.feedback.setText(f"Added to your calendar for {day}.")
             QTimer.singleShot(4000, self.feedback.clear)
         self.task_input.clear()
         self.render_tasks()
@@ -1140,6 +1284,14 @@ class PetWidget(QWidget):
             for weekday in Qt.DayOfWeek:
                 calendar.setWeekdayTextFormat(weekday, day_format)
             calendar.setHeaderTextFormat(header_format)
+            # The built-in month arrows are icons that vanish on some themes; use text.
+            for name, arrow in (("qt_calendar_prevmonth", "‹"), ("qt_calendar_nextmonth", "›")):
+                button = calendar.findChild(QToolButton, name)
+                if button is not None:
+                    button.setIcon(QIcon())
+                    button.setText(arrow)
+                    button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+                    button.setStyleSheet("font-size: 18px; padding: 0 10px;")
         self.refresh_calendar_marks()
         if self.confirm_dialog is not None:
             self.confirm_dialog.setStyleSheet(self.styleSheet())

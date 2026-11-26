@@ -41,10 +41,11 @@ Wilson uses a per-user Windows startup entry and a Windows mutex for single-inst
 - Add your own tasks and choose how each one's deadline works:
   - **Countdown**: finish within a set number of minutes. Repeats daily.
   - **End by**: finish by a time of day, e.g. 11:55 PM. Repeats daily.
-  - **Due date**: a one-off task due on a chosen date and time, picked from a calendar. It can be days away.
+  - **Date**: a one-off task due on a chosen date and time, picked from a calendar. It can be days away.
+  - **Weekly**: repeats on the weekdays you pick (e.g. Mon, Wed, Thu, Sat), finishing by a set time each of those days.
 
   Each task shows how long is left and is flagged as overdue once time runs out.
-- Dated tasks appear under **Upcoming** until their day arrives. The **Calendar** page highlights days with tasks due, lists the tasks for the selected day, and can start a new task on that day.
+- Dated tasks, and weekly tasks on their off days, appear under **Upcoming** until their day arrives. A weekly task can only be completed on one of its days. The **Calendar** page highlights days with dated tasks, lists everything scheduled for the selected day (including weekly tasks), and can start a new task on that day.
 - Confirm a task before it is marked complete. Completed tasks are crossed out and cannot be completed again that day.
 - The dog's mood slowly fades during the day. Finishing tasks raises it; finishing all tasks sets it to 100% until the next day.
 - Open **Settings** (below the task list) to choose the dog's name, temperament, and icon, and the Windows sign-in startup option.
