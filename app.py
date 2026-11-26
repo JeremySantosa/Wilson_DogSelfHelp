@@ -11,11 +11,15 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from ctypes import wintypes
 
-from PySide6.QtCore import QStandardPaths, QTimer, Qt, Signal
+from PySide6.QtCore import QDate, QDateTime, QStandardPaths, QTime, QTimer, Qt, Signal
+from PySide6.QtGui import QColor, QTextCharFormat
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
+    QCalendarWidget,
     QComboBox,
     QCheckBox,
+    QDateTimeEdit,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -25,8 +29,10 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizeGrip,
+    QSizePolicy,
     QSpinBox,
     QStackedWidget,
+    QTimeEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -37,9 +43,18 @@ ERROR_ALREADY_EXISTS = 183
 DEFAULT_TASK_MINUTES = 60
 MIN_WIDTH = 340
 DEFAULT_WIDTH = 390
-DEFAULT_HEIGHT = 560
+DEFAULT_HEIGHT = 620
 TASKS_PAGE = 0
 SETTINGS_PAGE = 1
+CALENDAR_PAGE = 2
+DEFAULT_END_TIME = "23:55"
+
+# How a task's deadline is set. Countdown and "end by" tasks repeat every day;
+# dated tasks happen once and can be days away.
+KIND_COUNTDOWN = "countdown"
+KIND_TIME = "time"
+KIND_DATE = "date"
+TASK_KINDS = (KIND_COUNTDOWN, KIND_TIME, KIND_DATE)
 
 
 def acquire_instance_mutex():
@@ -107,10 +122,30 @@ def build_stylesheet(p: dict) -> str:
         QLabel#status {{ color: {p['muted']}; }}
         QLabel#timeLeft {{ color: {p['faint']}; font-size: 11px; }}
         QLabel#timeLeft[overdue="true"] {{ color: {p['overdue']}; font-weight: 700; }}
-        QLineEdit, QComboBox, QSpinBox {{
+        QLineEdit, QComboBox, QAbstractSpinBox {{
             background: {p['input']}; border: 1px solid {p['input_border']};
             border-radius: 7px; padding: 6px; color: {p['text']};
         }}
+        QLabel#sectionNote {{ color: {p['faint']}; font-size: 11px; font-weight: 700;
+                             margin-top: 4px; }}
+        QPushButton#segment {{ background: {p['secondary']}; color: {p['secondary_text']};
+                              padding: 6px 8px; }}
+        QPushButton#segment:hover:!checked {{ background: {p['border']}; }}
+        QPushButton#segment:checked {{ background: {p['accent']}; color: {p['accent_text']};
+                                      font-weight: 700; }}
+        QCalendarWidget QWidget#qt_calendar_navigationbar {{ background: {p['card']}; }}
+        QCalendarWidget QToolButton {{ color: {p['text']}; background: transparent;
+                                      border: 0; padding: 4px 6px; font-weight: 700; }}
+        QCalendarWidget QToolButton:hover {{ background: {p['secondary']};
+                                            border-radius: 6px; }}
+        QCalendarWidget QToolButton::menu-indicator {{ image: none; }}
+        QCalendarWidget QMenu {{ background: {p['input']}; color: {p['text']}; }}
+        QCalendarWidget QSpinBox {{ padding: 2px; }}
+        QCalendarWidget QAbstractItemView {{
+            background: {p['input']}; color: {p['text']}; outline: 0;
+            selection-background-color: {p['accent']}; selection-color: {p['accent_text']};
+        }}
+        QCalendarWidget QAbstractItemView:disabled {{ color: {p['disabled_text']}; }}
         QComboBox QAbstractItemView {{
             background: {p['input']}; color: {p['text']};
             selection-background-color: {p['accent']};
@@ -137,24 +172,74 @@ def build_stylesheet(p: dict) -> str:
         QProgressBar::chunk {{ background: {p['good']}; border-radius: 6px; }}
         QScrollArea {{ border: 0; background: transparent; }}
         QScrollArea > QWidget > QWidget {{ background: transparent; }}
+        QScrollBar:vertical {{ background: transparent; width: 8px; margin: 2px 0 2px 2px; }}
+        QScrollBar::handle:vertical {{ background: {p['input_border']}; border-radius: 3px;
+                                      min-height: 24px; }}
+        QScrollBar::handle:vertical:hover {{ background: {p['popup_border']}; }}
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+        QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: none; }}
     """
 
 
-def time_left_text(task: dict) -> tuple[str, bool]:
-    """Return a short countdown label for a task and whether it is overdue."""
-    if task.get("done"):
-        return "done", False
+def clock_text(moment: datetime) -> str:
+    """Format a time as e.g. '11:55 PM' (Windows strftime has no %-I)."""
+    return moment.strftime("%I:%M %p").lstrip("0")
+
+
+def next_occurrence(end_time: str, now: datetime | None = None) -> datetime:
+    """The next time the clock reads end_time ('HH:MM'): today, or tomorrow if it has passed."""
+    now = now or datetime.now()
+    due = datetime.combine(now.date(), datetime.strptime(end_time, "%H:%M").time())
+    if due <= now:
+        due += timedelta(days=1)
+    return due
+
+
+def task_due(task: dict) -> datetime | None:
     try:
-        due = datetime.fromisoformat(task["due_at"])
+        return datetime.fromisoformat(task["due_at"])
     except (KeyError, TypeError, ValueError):
+        return None
+
+
+def time_left_text(task: dict) -> tuple[str, bool]:
+    """Return a short label describing when a task is due, and whether it is overdue."""
+    if task.get("done"):
+        return "Done", False
+    due = task_due(task)
+    if due is None:
         return "", False
+
+    kind = task.get("kind", KIND_COUNTDOWN)
+    today = date.today()
+    if kind == KIND_TIME:
+        when = f"By {clock_text(due)}"
+        if due.date() > today:
+            when += " tomorrow"
+    elif kind == KIND_DATE:
+        if due.date() == today:
+            day = "today"
+        elif due.date() == today + timedelta(days=1):
+            day = "tomorrow"
+        else:
+            day = due.strftime("%a %d %b").replace(" 0", " ")
+        when = f"Due {day}, {clock_text(due)}"
+    else:
+        when = f"{task.get('duration_minutes', DEFAULT_TASK_MINUTES)} min countdown"
+
     seconds = (due - datetime.now()).total_seconds()
     if seconds <= 0:
-        return "Overdue", True
-    hours, minutes = divmod(math.ceil(seconds / 60), 60)
-    if hours:
-        return f"{hours}h {minutes:02d}m left", False
-    return f"{minutes}m left", False
+        return f"{when} · Overdue", True
+    total_minutes = math.ceil(seconds / 60)
+    days, remainder = divmod(total_minutes, 24 * 60)
+    hours, minutes = divmod(remainder, 60)
+    if days:
+        left = f"{days}d {hours}h left"
+    elif hours:
+        left = f"{hours}h {minutes:02d}m left"
+    else:
+        left = f"{minutes}m left"
+    return f"{when} · {left}", False
 
 
 class DragBar(QWidget):
@@ -186,22 +271,29 @@ class TaskRow(QFrame):
         super().__init__(parent)
         self.task_id = task["id"]
         self.setObjectName("taskRow")
+        # Keep each row at its natural height so a long list scrolls instead of squashing.
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
 
         row = QHBoxLayout(self)
         row.setContentsMargins(10, 7, 8, 7)
         row.setSpacing(8)
 
+        # Title on top, with the due/countdown details underneath it.
+        text_column = QVBoxLayout()
+        text_column.setSpacing(1)
         title = html.escape(task["title"])
         if task.get("done", False):
             title = f"<s>{title}</s>"
         self.title_label = QLabel(title)
         self.title_label.setWordWrap(True)
         self.title_label.setTextFormat(Qt.TextFormat.RichText)
-        row.addWidget(self.title_label, 1)
+        text_column.addWidget(self.title_label)
 
         self.time_left = QLabel()
         self.time_left.setObjectName("timeLeft")
-        row.addWidget(self.time_left)
+        self.time_left.setWordWrap(True)
+        text_column.addWidget(self.time_left)
+        row.addLayout(text_column, 1)
         self.update_time_left(task)
 
         self.complete_button = QPushButton("Complete")
@@ -320,6 +412,7 @@ class PetWidget(QWidget):
         self.pages = QStackedWidget()
         self.pages.addWidget(self.build_tasks_page())
         self.pages.addWidget(self.build_settings_page())
+        self.pages.addWidget(self.build_calendar_page())
         body_layout.addWidget(self.pages, 1)
 
         self.feedback = QLabel("")
@@ -354,22 +447,60 @@ class PetWidget(QWidget):
         page_layout.setSpacing(9)
 
         page_layout.addWidget(self.section_label("Today's tasks"))
-        add_row = QHBoxLayout()
         self.task_input = QLineEdit()
         self.task_input.setPlaceholderText("What do you want to do?")
         self.task_input.returnPressed.connect(self.add_task)
-        add_row.addWidget(self.task_input, 1)
+        page_layout.addWidget(self.task_input)
+
+        # Pick how the deadline is set: a countdown, a time of day, or a date.
+        kind_row = QHBoxLayout()
+        kind_row.setSpacing(6)
+        self.kind_buttons = QButtonGroup(self)
+        self.kind_buttons.setExclusive(True)
+        kind_options = (
+            (KIND_COUNTDOWN, "Countdown", "Finish within a set number of minutes. Repeats daily."),
+            (KIND_TIME, "End by", "Finish by a time of day, e.g. 11:55 PM. Repeats daily."),
+            (KIND_DATE, "Due date", "A one-off task due on a date, even days away."),
+        )
+        for index, (_kind, label, tip) in enumerate(kind_options):
+            button = QPushButton(label)
+            button.setObjectName("segment")
+            button.setCheckable(True)
+            button.setToolTip(tip)
+            self.kind_buttons.addButton(button, index)
+            kind_row.addWidget(button, 1)
+        self.kind_buttons.idToggled.connect(self.on_kind_toggled)
+        page_layout.addLayout(kind_row)
+
+        add_row = QHBoxLayout()
+        self.deadline_inputs = QStackedWidget()
+
         self.duration_input = QSpinBox()
         self.duration_input.setRange(5, 24 * 60)
         self.duration_input.setSingleStep(5)
         self.duration_input.setValue(DEFAULT_TASK_MINUTES)
         self.duration_input.setSuffix(" min")
         self.duration_input.setToolTip("How long you have to finish this task")
-        add_row.addWidget(self.duration_input)
+        self.deadline_inputs.addWidget(self.duration_input)
+
+        self.end_time_input = QTimeEdit(QTime.fromString(DEFAULT_END_TIME, "HH:mm"))
+        self.end_time_input.setDisplayFormat("h:mm AP")
+        self.end_time_input.setToolTip("Finish by this time (tomorrow if it has already passed)")
+        self.deadline_inputs.addWidget(self.end_time_input)
+
+        self.due_date_input = QDateTimeEdit()
+        self.due_date_input.setCalendarPopup(True)
+        self.due_date_input.setDisplayFormat("ddd d MMM, h:mm AP")
+        self.due_date_input.setToolTip("Pick the day and time this task is due")
+        self.reset_due_date_input()
+        self.deadline_inputs.addWidget(self.due_date_input)
+
+        add_row.addWidget(self.deadline_inputs, 1)
         add_button = QPushButton("Add")
         add_button.clicked.connect(self.add_task)
         add_row.addWidget(add_button)
         page_layout.addLayout(add_row)
+        self.kind_buttons.button(0).setChecked(True)
 
         self.task_list = QWidget()
         self.task_list_layout = QVBoxLayout(self.task_list)
@@ -378,15 +509,71 @@ class PetWidget(QWidget):
         self.task_rows: dict[str, TaskRow] = {}
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         # The list grows and shrinks with the window instead of a fixed height.
         self.scroll.setMinimumHeight(90)
         self.scroll.setWidget(self.task_list)
         page_layout.addWidget(self.scroll, 1)
 
+        nav_row = QHBoxLayout()
+        calendar_button = QPushButton("\U0001F4C5  Calendar")
+        calendar_button.setObjectName("secondaryButton")
+        calendar_button.clicked.connect(lambda _checked=False: self.show_page(CALENDAR_PAGE))
+        nav_row.addWidget(calendar_button, 1)
         settings_button = QPushButton("⚙  Settings")
         settings_button.setObjectName("secondaryButton")
         settings_button.clicked.connect(lambda _checked=False: self.show_page(SETTINGS_PAGE))
-        page_layout.addWidget(settings_button)
+        nav_row.addWidget(settings_button, 1)
+        page_layout.addLayout(nav_row)
+        return page
+
+    def build_calendar_page(self) -> QWidget:
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        page_layout.setSpacing(6)
+
+        header = QHBoxLayout()
+        header.addWidget(self.section_label("Calendar"))
+        header.addStretch()
+        back_button = QPushButton("Back")
+        back_button.setObjectName("secondaryButton")
+        back_button.clicked.connect(lambda _checked=False: self.show_page(TASKS_PAGE))
+        header.addWidget(back_button)
+        page_layout.addLayout(header)
+
+        # Days with a dated task due are highlighted; pick one to see its tasks.
+        self.calendar = QCalendarWidget()
+        self.calendar.setGridVisible(False)
+        self.calendar.setVerticalHeaderFormat(
+            QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader
+        )
+        self.calendar.setHorizontalHeaderFormat(
+            QCalendarWidget.HorizontalHeaderFormat.ShortDayNames
+        )
+        self.calendar.setMinimumHeight(190)
+        self.calendar.selectionChanged.connect(self.render_calendar_day)
+        page_layout.addWidget(self.calendar)
+
+        self.calendar_day_label = QLabel()
+        self.calendar_day_label.setStyleSheet("font-weight: 700;")
+        page_layout.addWidget(self.calendar_day_label)
+
+        self.calendar_day_list = QWidget()
+        self.calendar_day_layout = QVBoxLayout(self.calendar_day_list)
+        self.calendar_day_layout.setContentsMargins(0, 0, 0, 0)
+        self.calendar_day_layout.setSpacing(6)
+        self.calendar_rows: dict[str, TaskRow] = {}
+        day_scroll = QScrollArea()
+        day_scroll.setWidgetResizable(True)
+        day_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        day_scroll.setMinimumHeight(60)
+        day_scroll.setWidget(self.calendar_day_list)
+        page_layout.addWidget(day_scroll, 1)
+
+        self.add_on_day_button = QPushButton("Add a task on this day")
+        self.add_on_day_button.clicked.connect(self.start_task_on_selected_day)
+        page_layout.addWidget(self.add_on_day_button)
         return page
 
     def build_settings_page(self) -> QWidget:
@@ -429,7 +616,7 @@ class PetWidget(QWidget):
         self.dog_style.currentIndexChanged.connect(self.save_dog_style)
         page_layout.addWidget(self.dog_style)
 
-        self.startup_toggle = QCheckBox("Start Wilson when I sign into Windows")
+        self.startup_toggle = QCheckBox("Auto-start with Windows")
         self.startup_toggle.setVisible(self.is_packaged_windows())
         self.startup_toggle.setChecked(bool(self.state.get("start_with_windows", True)))
         self.startup_toggle.toggled.connect(self.save_startup_setting)
@@ -440,7 +627,32 @@ class PetWidget(QWidget):
         return page
 
     def show_page(self, index: int) -> None:
+        if index == CALENDAR_PAGE:
+            self.render_calendar_day()
         self.pages.setCurrentIndex(index)
+
+    def on_kind_toggled(self, index: int, checked: bool) -> None:
+        if checked:
+            self.deadline_inputs.setCurrentIndex(index)
+
+    def selected_kind(self) -> str:
+        return TASK_KINDS[max(0, self.kind_buttons.checkedId())]
+
+    def reset_due_date_input(self) -> None:
+        """Default the date picker to tomorrow at 5 PM, and forbid past times."""
+        now = QDateTime.currentDateTime()
+        self.due_date_input.setMinimumDateTime(now)
+        self.due_date_input.setDateTime(QDateTime(now.date().addDays(1), QTime(17, 0)))
+
+    def start_task_on_selected_day(self) -> None:
+        """Jump to the add form with 'Due date' picked and the calendar's day filled in."""
+        selected = self.calendar.selectedDate()
+        self.due_date_input.setMinimumDateTime(QDateTime.currentDateTime())
+        time_of_day = self.due_date_input.time()
+        self.due_date_input.setDateTime(QDateTime(selected, time_of_day))
+        self.kind_buttons.button(TASK_KINDS.index(KIND_DATE)).setChecked(True)
+        self.show_page(TASKS_PAGE)
+        self.task_input.setFocus()
 
     @staticmethod
     def section_label(text: str) -> QLabel:
@@ -516,28 +728,56 @@ class PetWidget(QWidget):
         return state
 
     @staticmethod
-    def migrate_task_timing(task: dict) -> None:
-        """Give every task a duration and a due time, converting old clock deadlines."""
+    def valid_clock(value) -> bool:
+        try:
+            datetime.strptime(value, "%H:%M")
+            return True
+        except (TypeError, ValueError):
+            return False
+
+    @classmethod
+    def migrate_task_timing(cls, task: dict) -> None:
+        """Give every task a kind and a due time, converting older saved formats."""
+        old_deadline = task.pop("deadline", None)
+        if task.get("kind") not in TASK_KINDS:
+            # Very old versions stored "end by" times as a bare 'HH:MM' deadline.
+            if cls.valid_clock(old_deadline):
+                task["kind"] = KIND_TIME
+                task["end_time"] = old_deadline
+            else:
+                task["kind"] = KIND_COUNTDOWN
+        if task["kind"] == KIND_TIME and not cls.valid_clock(task.get("end_time")):
+            task["kind"] = KIND_COUNTDOWN
         try:
             task["duration_minutes"] = max(1, int(task["duration_minutes"]))
         except (KeyError, TypeError, ValueError):
             task["duration_minutes"] = DEFAULT_TASK_MINUTES
-        try:
-            datetime.fromisoformat(task["due_at"])
+
+        if task_due(task) is not None:
             return
-        except (KeyError, TypeError, ValueError):
-            pass
-        due = None
-        old_deadline = task.pop("deadline", None)
-        if isinstance(old_deadline, str):
-            try:
-                clock = datetime.strptime(old_deadline, "%H:%M").time()
-                due = datetime.combine(date.today(), clock)
-            except ValueError:
-                pass
-        if due is None:
+        if task["kind"] == KIND_TIME:
+            clock = datetime.strptime(task["end_time"], "%H:%M").time()
+            due = datetime.combine(date.today(), clock)
+        else:
+            # A dated task without a date can't be recovered; treat it as a countdown.
+            task["kind"] = KIND_COUNTDOWN
             due = datetime.now() + timedelta(minutes=task["duration_minutes"])
         task["due_at"] = due.isoformat(timespec="seconds")
+
+    @staticmethod
+    def is_today_task(task: dict) -> bool:
+        """Daily tasks always count for today; dated tasks only once their day arrives."""
+        if task.get("kind") != KIND_DATE:
+            return True
+        due = task_due(task)
+        return due is None or due.date() <= date.today()
+
+    def today_tasks(self) -> list[dict]:
+        return [task for task in self.state["tasks"] if self.is_today_task(task)]
+
+    def dated_tasks(self) -> list[dict]:
+        tasks = [task for task in self.state["tasks"] if task.get("kind") == KIND_DATE]
+        return sorted(tasks, key=lambda task: task["due_at"])
 
     def save_state(self) -> None:
         try:
@@ -555,12 +795,23 @@ class PetWidget(QWidget):
             return
         self.state["day"] = today
         now = datetime.now()
+        kept = []
         for task in self.state["tasks"]:
+            if task["kind"] == KIND_DATE:
+                # Dated tasks are one-offs: drop finished ones, keep the rest as they are.
+                if not task.get("done"):
+                    kept.append(task)
+                continue
             task["done"] = False
-            # Each new day restarts the task's countdown.
-            task["due_at"] = (
-                now + timedelta(minutes=task["duration_minutes"])
-            ).isoformat(timespec="seconds")
+            # Each new day restarts countdowns and moves "end by" times to today.
+            if task["kind"] == KIND_TIME:
+                clock = datetime.strptime(task["end_time"], "%H:%M").time()
+                due = datetime.combine(now.date(), clock)
+            else:
+                due = now + timedelta(minutes=task["duration_minutes"])
+            task["due_at"] = due.isoformat(timespec="seconds")
+            kept.append(task)
+        self.state["tasks"] = kept
         self.state["mood"] = 100.0
         self.state["mood_frozen"] = False
         self.state["mood_updated_at"] = now.isoformat()
@@ -599,7 +850,7 @@ class PetWidget(QWidget):
         self.mood_value.setText(f"{mood}%")
         self.mood_bar.setValue(mood)
 
-        tasks = self.state["tasks"]
+        tasks = self.today_tasks()
         complete_count = sum(task.get("done", False) for task in tasks)
         if tasks and complete_count == len(tasks):
             message_key = "done"
@@ -611,31 +862,100 @@ class PetWidget(QWidget):
         self.mood_message.setText(TEMPERAMENT_MESSAGES[temperament][message_key])
         self.pet.setText(self.state["dog_style"])
 
-    def render_tasks(self) -> None:
-        while self.task_list_layout.count():
-            item = self.task_list_layout.takeAt(0)
+    @staticmethod
+    def clear_layout(layout) -> None:
+        while layout.count():
+            item = layout.takeAt(0)
             if item.widget():
+                # Hide now so old rows never flash behind new ones before deletion.
+                item.widget().hide()
                 item.widget().deleteLater()
+
+    def make_task_row(self, task: dict, parent: QWidget) -> TaskRow:
+        row = TaskRow(task, parent)
+        row.complete_requested.connect(self.confirm_task)
+        row.remove_requested.connect(self.remove_task)
+        return row
+
+    @staticmethod
+    def note_label(text: str, object_name: str = "status") -> QLabel:
+        label = QLabel(text)
+        label.setObjectName(object_name)
+        label.setWordWrap(True)
+        return label
+
+    def render_tasks(self) -> None:
+        self.clear_layout(self.task_list_layout)
         self.task_rows = {}
 
-        tasks = self.state["tasks"]
-        if not tasks:
-            empty = QLabel("Add a task to start today's list.")
-            empty.setObjectName("status")
-            self.task_list_layout.addWidget(empty)
-        for task in tasks:
-            row = TaskRow(task, self.task_list)
-            row.complete_requested.connect(self.confirm_task)
-            row.remove_requested.connect(self.remove_task)
+        today = self.today_tasks()
+        upcoming = [task for task in self.dated_tasks() if not self.is_today_task(task)]
+        if not today:
+            self.task_list_layout.addWidget(
+                self.note_label("Add a task to start today's list.")
+            )
+        for task in today:
+            row = self.make_task_row(task, self.task_list)
             self.task_list_layout.addWidget(row)
             self.task_rows[task["id"]] = row
+        if upcoming:
+            self.task_list_layout.addWidget(self.note_label("UPCOMING", "sectionNote"))
+            for task in upcoming:
+                row = self.make_task_row(task, self.task_list)
+                self.task_list_layout.addWidget(row)
+                self.task_rows[task["id"]] = row
         self.task_list_layout.addStretch(1)
+
+        self.refresh_calendar_marks()
+        self.render_calendar_day()
+
+    def refresh_calendar_marks(self) -> None:
+        """Highlight days with dated tasks: accent if any are unfinished, green if all done."""
+        palette = THEMES[self.state["theme"]]
+        self.calendar.setDateTextFormat(QDate(), QTextCharFormat())  # clears every mark
+        days: dict[date, bool] = {}
+        for task in self.dated_tasks():
+            day = task_due(task).date()
+            days[day] = days.get(day, False) or not task.get("done")
+        for day, has_pending in days.items():
+            mark = QTextCharFormat()
+            mark.setFontWeight(700)
+            mark.setBackground(QColor(palette["accent"] if has_pending else palette["good"]))
+            mark.setForeground(QColor(palette["accent_text"]))
+            self.calendar.setDateTextFormat(QDate(day.year, day.month, day.day), mark)
+
+    def render_calendar_day(self) -> None:
+        self.clear_layout(self.calendar_day_layout)
+        self.calendar_rows = {}
+        day = self.calendar.selectedDate().toPython()
+        today = date.today()
+        if day == today:
+            title = "Due today"
+        elif day == today + timedelta(days=1):
+            title = "Due tomorrow"
+        else:
+            title = "Due " + day.strftime("%A %d %B").replace(" 0", " ")
+        self.calendar_day_label.setText(title)
+
+        tasks = [task for task in self.dated_tasks() if task_due(task).date() == day]
+        if not tasks:
+            self.calendar_day_layout.addWidget(
+                self.note_label("No dated tasks this day. Countdown and "
+                                "end-by tasks repeat daily on the main list.")
+            )
+        for task in tasks:
+            row = self.make_task_row(task, self.calendar_day_list)
+            self.calendar_day_layout.addWidget(row)
+            self.calendar_rows[task["id"]] = row
+        self.calendar_day_layout.addStretch(1)
+        self.add_on_day_button.setEnabled(day >= today)
 
     def update_time_left_labels(self) -> None:
         for task in self.state["tasks"]:
-            row = self.task_rows.get(task["id"])
-            if row is not None:
-                row.update_time_left(task)
+            for rows in (self.task_rows, self.calendar_rows):
+                row = rows.get(task["id"])
+                if row is not None:
+                    row.update_time_left(task)
 
     def add_task(self) -> None:
         title = self.task_input.text().strip()
@@ -643,20 +963,39 @@ class PetWidget(QWidget):
             self.task_input.setFocus()
             return
 
-        self.update_mood()
-        duration = self.duration_input.value()
-        due = datetime.now() + timedelta(minutes=duration)
-        self.state["tasks"].append({
+        kind = self.selected_kind()
+        now = datetime.now()
+        task = {
             "id": str(uuid.uuid4()),
             "title": title,
-            "duration_minutes": duration,
-            "due_at": due.isoformat(timespec="seconds"),
+            "kind": kind,
+            "duration_minutes": self.duration_input.value(),
             "done": False,
-        })
-        self.state["mood_frozen"] = False
-        self.state["mood_updated_at"] = datetime.now().isoformat()
+        }
+        if kind == KIND_TIME:
+            task["end_time"] = self.end_time_input.time().toString("HH:mm")
+            due = next_occurrence(task["end_time"], now)
+        elif kind == KIND_DATE:
+            due = self.due_date_input.dateTime().toPython().replace(second=0, microsecond=0)
+            if due <= now:
+                self.feedback.setText("Pick a due time that hasn't passed yet.")
+                return
+        else:
+            due = now + timedelta(minutes=task["duration_minutes"])
+        task["due_at"] = due.isoformat(timespec="seconds")
+
+        self.update_mood()
+        self.state["tasks"].append(task)
+        if self.is_today_task(task):
+            # A new task for today means the list is no longer all done.
+            self.state["mood_frozen"] = False
+            self.state["mood_updated_at"] = now.isoformat()
+            self.feedback.clear()
+        else:
+            day = due.strftime("%a %d %b").replace(" 0", " ")
+            self.feedback.setText(f"Added to your calendar for {day}.")
+            QTimer.singleShot(4000, self.feedback.clear)
         self.task_input.clear()
-        self.feedback.clear()
         self.render_tasks()
         self.refresh_view()
         self.save_state()
@@ -734,9 +1073,10 @@ class PetWidget(QWidget):
 
         self.update_mood()
         task["done"] = True
-        reward = max(5.0, 60.0 / max(1, len(self.state["tasks"])))
+        today = self.today_tasks()
+        reward = max(5.0, 60.0 / max(1, len(today)))
         self.state["mood"] = min(100.0, float(self.state["mood"]) + reward)
-        if self.state["tasks"] and all(item.get("done") for item in self.state["tasks"]):
+        if today and all(item.get("done") for item in today):
             self.state["mood"] = 100.0
             self.state["mood_frozen"] = True
 
@@ -751,7 +1091,8 @@ class PetWidget(QWidget):
         self.state["tasks"] = [
             task for task in self.state["tasks"] if task["id"] != task_id
         ]
-        if self.state["tasks"] and all(task.get("done") for task in self.state["tasks"]):
+        today = self.today_tasks()
+        if today and all(task.get("done") for task in today):
             self.state["mood"] = 100.0
             self.state["mood_frozen"] = True
         self.render_tasks()
@@ -787,6 +1128,19 @@ class PetWidget(QWidget):
         else:
             self.theme_button.setText("☀")
             self.theme_button.setToolTip("Switch to light mode")
+        # Calendars colour weekends and headers themselves, so match them to the theme.
+        palette = THEMES[self.state["theme"]]
+        day_format = QTextCharFormat()
+        day_format.setForeground(QColor(palette["text"]))
+        header_format = QTextCharFormat()
+        header_format.setForeground(QColor(palette["faint"]))
+        header_format.setFontWeight(700)
+        header_format.setBackground(QColor(palette["input"]))
+        for calendar in (self.calendar, self.due_date_input.calendarWidget()):
+            for weekday in Qt.DayOfWeek:
+                calendar.setWeekdayTextFormat(weekday, day_format)
+            calendar.setHeaderTextFormat(header_format)
+        self.refresh_calendar_marks()
         if self.confirm_dialog is not None:
             self.confirm_dialog.setStyleSheet(self.styleSheet())
 
