@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import html
+import ctypes
 import json
+import math
 import sys
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from ctypes import wintypes
 
-from PySide6.QtCore import QLockFile, QStandardPaths, QTime, QTimer, Qt, Signal
+from PySide6.QtCore import QStandardPaths, QTimer, Qt, Signal
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -21,13 +24,36 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
-    QTimeEdit,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
 
 MOOD_DECAY_PER_HOUR = 2.0
+ERROR_ALREADY_EXISTS = 183
+DEFAULT_TASK_MINUTES = 60
+
+
+def acquire_instance_mutex():
+    """Return a held Windows mutex, or None if another instance owns it."""
+    if sys.platform != "win32":
+        return True
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_mutex = kernel32.CreateMutexW
+    create_mutex.argtypes = (wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR)
+    create_mutex.restype = wintypes.HANDLE
+    ctypes.set_last_error(0)
+    handle = create_mutex(None, True, r"Local\WilsonDogSelfHelp")
+    error_code = ctypes.get_last_error()
+    if not handle:
+        raise ctypes.WinError(error_code)
+
+    if error_code == ERROR_ALREADY_EXISTS:
+        kernel32.CloseHandle(handle)
+        return None
+    return kernel32, handle
 
 TEMPERAMENT_MESSAGES = {
     "Kind": {
@@ -40,12 +66,88 @@ TEMPERAMENT_MESSAGES = {
         "progress": "Look at you, being all responsible.",
         "done": "Fine, that was pretty impressive.",
     },
-    "Asshole": {
-        "idle": "tf you looking at me for",
-        "progress": "ayyy you got it done, now do the rest",
-        "done": "you not bad bro",
+}
+
+# Colour palettes for the light and dark themes.
+THEMES = {
+    "light": {
+        "card": "#fffaf0", "border": "#eadfca", "text": "#332d27",
+        "muted": "#66594c", "faint": "#76695d", "input": "#fffdf8",
+        "input_border": "#ded2c2", "popup_border": "#cbbba6",
+        "accent": "#e9a86c", "accent_hover": "#f0b77f", "accent_text": "#30251c",
+        "secondary": "#eee7dc", "secondary_text": "#30251c",
+        "disabled": "#ded7cc", "disabled_text": "#756e64",
+        "track": "#eee7dc", "good": "#91b887", "overdue": "#c0503a",
+    },
+    "dark": {
+        "card": "#2a2521", "border": "#3e3630", "text": "#f2eadf",
+        "muted": "#c8bbab", "faint": "#a89b8c", "input": "#352f2a",
+        "input_border": "#4b423a", "popup_border": "#5a5047",
+        "accent": "#e9a86c", "accent_hover": "#f0b77f", "accent_text": "#30251c",
+        "secondary": "#443b34", "secondary_text": "#f2eadf",
+        "disabled": "#3e3630", "disabled_text": "#8a7f74",
+        "track": "#443b34", "good": "#91b887", "overdue": "#ef8a73",
     },
 }
+
+
+def build_stylesheet(p: dict) -> str:
+    return f"""
+        QFrame#card {{ background: {p['card']}; border: 1px solid {p['border']};
+                      border-radius: 18px; }}
+        QLabel {{ color: {p['text']}; }}
+        QLabel#pet {{ font-size: 52px; }}
+        QLabel#status {{ color: {p['muted']}; }}
+        QLabel#timeLeft {{ color: {p['faint']}; font-size: 11px; }}
+        QLabel#timeLeft[overdue="true"] {{ color: {p['overdue']}; font-weight: 700; }}
+        QLineEdit, QComboBox, QSpinBox {{
+            background: {p['input']}; border: 1px solid {p['input_border']};
+            border-radius: 7px; padding: 6px; color: {p['text']};
+        }}
+        QComboBox QAbstractItemView {{
+            background: {p['input']}; color: {p['text']};
+            selection-background-color: {p['accent']};
+            selection-color: {p['accent_text']}; border: 1px solid {p['popup_border']};
+            outline: 0;
+        }}
+        QComboBox QAbstractItemView::item {{ min-height: 28px; padding: 4px 8px; }}
+        QCheckBox {{ color: {p['text']}; }}
+        QPushButton {{ background: {p['accent']}; color: {p['accent_text']}; border: 0;
+                      border-radius: 8px; padding: 7px 10px; }}
+        QPushButton:hover {{ background: {p['accent_hover']}; }}
+        QPushButton:disabled {{ background: {p['disabled']}; color: {p['disabled_text']}; }}
+        QPushButton#secondaryButton {{ background: {p['secondary']};
+                                      color: {p['secondary_text']}; }}
+        QMessageBox {{ background: {p['card']}; color: {p['text']}; }}
+        QMessageBox QLabel {{ background: transparent; color: {p['text']}; }}
+        QMessageBox QPushButton {{ background: {p['accent']}; color: {p['accent_text']};
+                                  min-width: 78px; }}
+        QMessageBox QPushButton:hover {{ background: {p['accent_hover']}; }}
+        QFrame#taskRow {{ background: {p['input']}; border: 1px solid {p['border']};
+                         border-radius: 10px; }}
+        QProgressBar {{ background: {p['track']}; border: 0; border-radius: 6px;
+                       height: 12px; text-align: center; }}
+        QProgressBar::chunk {{ background: {p['good']}; border-radius: 6px; }}
+        QScrollArea {{ border: 0; background: transparent; }}
+        QScrollArea > QWidget > QWidget {{ background: transparent; }}
+    """
+
+
+def time_left_text(task: dict) -> tuple[str, bool]:
+    """Return a short countdown label for a task and whether it is overdue."""
+    if task.get("done"):
+        return "done", False
+    try:
+        due = datetime.fromisoformat(task["due_at"])
+    except (KeyError, TypeError, ValueError):
+        return "", False
+    seconds = (due - datetime.now()).total_seconds()
+    if seconds <= 0:
+        return "Overdue", True
+    hours, minutes = divmod(math.ceil(seconds / 60), 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m left", False
+    return f"{minutes}m left", False
 
 
 class DragBar(QWidget):
@@ -90,9 +192,10 @@ class TaskRow(QFrame):
         self.title_label.setTextFormat(Qt.TextFormat.RichText)
         row.addWidget(self.title_label, 1)
 
-        deadline = QLabel(f"by {task['deadline']}")
-        deadline.setObjectName("deadline")
-        row.addWidget(deadline)
+        self.time_left = QLabel()
+        self.time_left.setObjectName("timeLeft")
+        row.addWidget(self.time_left)
+        self.update_time_left(task)
 
         self.complete_button = QPushButton("Complete")
         self.complete_button.setEnabled(not task.get("done", False))
@@ -107,6 +210,15 @@ class TaskRow(QFrame):
             lambda _checked=False: self.remove_requested.emit(self.task_id)
         )
         row.addWidget(remove_button)
+
+    def update_time_left(self, task: dict) -> None:
+        text, overdue = time_left_text(task)
+        self.time_left.setText(text)
+        if self.time_left.property("overdue") != overdue:
+            # Re-polish so the [overdue="true"] style rule is re-evaluated.
+            self.time_left.setProperty("overdue", overdue)
+            self.time_left.style().unpolish(self.time_left)
+            self.time_left.style().polish(self.time_left)
 
 
 class PetWidget(QWidget):
@@ -130,30 +242,6 @@ class PetWidget(QWidget):
         self.roll_over_day_if_needed()
         self.update_mood()
 
-        self.setStyleSheet("""
-            QFrame#card { background: #fffaf0; border: 1px solid #eadfca;
-                          border-radius: 18px; }
-            QLabel { color: #332d27; }
-            QLabel#pet { font-size: 52px; }
-            QLabel#status { color: #66594c; }
-            QLabel#deadline { color: #76695d; font-size: 11px; }
-            QLineEdit, QComboBox, QTimeEdit {
-                background: #fffdf8; border: 1px solid #ded2c2;
-                border-radius: 7px; padding: 6px; color: #332d27;
-            }
-            QPushButton { background: #e9a86c; color: #30251c; border: 0;
-                          border-radius: 8px; padding: 7px 10px; }
-            QPushButton:hover { background: #f0b77f; }
-            QPushButton:disabled { background: #ded7cc; color: #756e64; }
-            QPushButton#secondaryButton { background: #eee7dc; }
-            QFrame#taskRow { background: #fffdf8; border: 1px solid #eadfca;
-                             border-radius: 10px; }
-            QProgressBar { background: #eee7dc; border: 0; border-radius: 6px;
-                           height: 12px; text-align: center; }
-            QProgressBar::chunk { background: #91b887; border-radius: 6px; }
-            QScrollArea { border: 0; background: transparent; }
-        """)
-
         self.card = QFrame(self)
         self.card.setObjectName("card")
         layout = QVBoxLayout(self.card)
@@ -163,15 +251,34 @@ class PetWidget(QWidget):
         title_bar = DragBar(self)
         title_layout = QHBoxLayout(title_bar)
         title_layout.setContentsMargins(0, 0, 0, 0)
+        title_layout.setSpacing(6)
         self.name_heading = QLabel()
         self.name_heading.setStyleSheet("font-size: 16px; font-weight: 700;")
+        self.theme_button = QPushButton()
+        self.theme_button.setObjectName("secondaryButton")
+        self.theme_button.setFixedWidth(30)
+        self.theme_button.clicked.connect(self.toggle_theme)
+        self.minimize_button = QPushButton()
+        self.minimize_button.setObjectName("secondaryButton")
+        self.minimize_button.setFixedWidth(30)
+        self.minimize_button.clicked.connect(self.toggle_collapsed)
         close = QPushButton("×")
         close.setFixedWidth(30)
+        close.setToolTip("Close")
         close.clicked.connect(self.close)
         title_layout.addWidget(self.name_heading)
         title_layout.addStretch()
+        title_layout.addWidget(self.theme_button)
+        title_layout.addWidget(self.minimize_button)
         title_layout.addWidget(close)
         layout.addWidget(title_bar)
+
+        # Everything below the title bar lives in the body so it can be collapsed.
+        self.body = QWidget()
+        body_layout = QVBoxLayout(self.body)
+        body_layout.setContentsMargins(0, 0, 0, 0)
+        body_layout.setSpacing(9)
+        layout.addWidget(self.body)
 
         pet_row = QHBoxLayout()
         self.pet = QLabel()
@@ -182,20 +289,20 @@ class PetWidget(QWidget):
         self.mood_message.setObjectName("status")
         self.mood_message.setWordWrap(True)
         pet_row.addWidget(self.mood_message, 1)
-        layout.addLayout(pet_row)
+        body_layout.addLayout(pet_row)
 
         mood_header = QHBoxLayout()
         mood_header.addWidget(QLabel("Mood"))
         mood_header.addStretch()
         self.mood_value = QLabel()
         mood_header.addWidget(self.mood_value)
-        layout.addLayout(mood_header)
+        body_layout.addLayout(mood_header)
         self.mood_bar = QProgressBar()
         self.mood_bar.setRange(0, 100)
         self.mood_bar.setTextVisible(False)
-        layout.addWidget(self.mood_bar)
+        body_layout.addWidget(self.mood_bar)
 
-        layout.addWidget(self.section_label("Personalize your dog"))
+        body_layout.addWidget(self.section_label("Personalize your dog"))
         settings_row = QHBoxLayout()
         self.name_input = QLineEdit(self.state["name"])
         self.name_input.setPlaceholderText("Dog's name")
@@ -208,7 +315,7 @@ class PetWidget(QWidget):
         self.temperament.setCurrentText(self.state["temperament"])
         self.temperament.currentTextChanged.connect(self.save_temperament)
         settings_row.addWidget(self.temperament)
-        layout.addLayout(settings_row)
+        body_layout.addLayout(settings_row)
 
         self.dog_style = QComboBox()
         self.dog_style.addItem("Classic dog", "\U0001F436")
@@ -218,48 +325,54 @@ class PetWidget(QWidget):
         style_index = self.dog_style.findData(self.state["dog_style"])
         self.dog_style.setCurrentIndex(max(style_index, 0))
         self.dog_style.currentIndexChanged.connect(self.save_dog_style)
-        layout.addWidget(self.dog_style)
+        body_layout.addWidget(self.dog_style)
 
         self.startup_toggle = QCheckBox("Start Wilson when I sign into Windows")
         self.startup_toggle.setVisible(self.is_packaged_windows())
         self.startup_toggle.setChecked(bool(self.state.get("start_with_windows", True)))
         self.startup_toggle.toggled.connect(self.save_startup_setting)
-        layout.addWidget(self.startup_toggle)
+        body_layout.addWidget(self.startup_toggle)
 
-        layout.addWidget(self.section_label("Today's tasks"))
+        body_layout.addWidget(self.section_label("Today's tasks"))
         add_row = QHBoxLayout()
         self.task_input = QLineEdit()
         self.task_input.setPlaceholderText("What do you want to do?")
         self.task_input.returnPressed.connect(self.add_task)
         add_row.addWidget(self.task_input, 1)
-        self.deadline_input = QTimeEdit()
-        self.deadline_input.setDisplayFormat("h:mm AP")
-        self.deadline_input.setTime(QTime.currentTime().addSecs(60 * 60))
-        self.deadline_input.setToolTip("Choose today's deadline for this task")
-        add_row.addWidget(self.deadline_input)
+        self.duration_input = QSpinBox()
+        self.duration_input.setRange(5, 24 * 60)
+        self.duration_input.setSingleStep(5)
+        self.duration_input.setValue(DEFAULT_TASK_MINUTES)
+        self.duration_input.setSuffix(" min")
+        self.duration_input.setToolTip("How long you have to finish this task")
+        add_row.addWidget(self.duration_input)
         add_button = QPushButton("Add")
         add_button.clicked.connect(self.add_task)
         add_row.addWidget(add_button)
-        layout.addLayout(add_row)
+        body_layout.addLayout(add_row)
 
         self.task_list = QWidget()
         self.task_list_layout = QVBoxLayout(self.task_list)
         self.task_list_layout.setContentsMargins(0, 0, 0, 0)
         self.task_list_layout.setSpacing(6)
+        self.task_rows: dict[str, TaskRow] = {}
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setMaximumHeight(230)
         self.scroll.setWidget(self.task_list)
-        layout.addWidget(self.scroll)
+        body_layout.addWidget(self.scroll)
 
         self.feedback = QLabel("")
         self.feedback.setObjectName("status")
-        layout.addWidget(self.feedback)
+        body_layout.addWidget(self.feedback)
+        self.confirm_dialog = None
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.addWidget(self.card)
 
+        self.apply_theme()
+        self.apply_collapsed()
         self.apply_startup_setting()
         self.render_tasks()
         self.refresh_view()
@@ -267,7 +380,7 @@ class PetWidget(QWidget):
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
-        self.timer.start(60_000)
+        self.timer.start(30_000)
 
     @staticmethod
     def section_label(text: str) -> QLabel:
@@ -286,6 +399,8 @@ class PetWidget(QWidget):
             "mood": 100.0,
             "mood_updated_at": datetime.now().isoformat(),
             "mood_frozen": False,
+            "theme": "light",
+            "collapsed": False,
             "start_with_windows": bool(
                 sys.platform == "win32" and getattr(sys, "frozen", False)
             ),
@@ -308,20 +423,48 @@ class PetWidget(QWidget):
             "\U0001F436", "\U0001F415", "\U0001F429", "\U0001F9AE"
         }:
             state["dog_style"] = "\U0001F436"
+        if state.get("theme") not in THEMES:
+            state["theme"] = "light"
+        state["collapsed"] = bool(state.get("collapsed", False))
         if not isinstance(state.get("tasks"), list):
             state["tasks"] = []
         state["tasks"] = [
             task for task in state["tasks"]
-            if isinstance(task, dict) and task.get("title") and task.get("deadline")
+            if isinstance(task, dict) and task.get("title")
         ]
         for task in state["tasks"]:
             task.setdefault("id", str(uuid.uuid4()))
             task.setdefault("done", False)
+            self.migrate_task_timing(task)
         try:
             state["mood"] = max(0.0, min(100.0, float(state["mood"])))
         except (TypeError, ValueError):
             state["mood"] = 100.0
         return state
+
+    @staticmethod
+    def migrate_task_timing(task: dict) -> None:
+        """Give every task a duration and a due time, converting old clock deadlines."""
+        try:
+            task["duration_minutes"] = max(1, int(task["duration_minutes"]))
+        except (KeyError, TypeError, ValueError):
+            task["duration_minutes"] = DEFAULT_TASK_MINUTES
+        try:
+            datetime.fromisoformat(task["due_at"])
+            return
+        except (KeyError, TypeError, ValueError):
+            pass
+        due = None
+        old_deadline = task.pop("deadline", None)
+        if isinstance(old_deadline, str):
+            try:
+                clock = datetime.strptime(old_deadline, "%H:%M").time()
+                due = datetime.combine(date.today(), clock)
+            except ValueError:
+                pass
+        if due is None:
+            due = datetime.now() + timedelta(minutes=task["duration_minutes"])
+        task["due_at"] = due.isoformat(timespec="seconds")
 
     def save_state(self) -> None:
         try:
@@ -338,12 +481,19 @@ class PetWidget(QWidget):
         if self.state.get("day") == today:
             return
         self.state["day"] = today
+        now = datetime.now()
         for task in self.state["tasks"]:
             task["done"] = False
+            # Each new day restarts the task's countdown.
+            task["due_at"] = (
+                now + timedelta(minutes=task["duration_minutes"])
+            ).isoformat(timespec="seconds")
         self.state["mood"] = 100.0
         self.state["mood_frozen"] = False
-        self.state["mood_updated_at"] = datetime.now().isoformat()
+        self.state["mood_updated_at"] = now.isoformat()
         self.save_state()
+        if hasattr(self, "task_rows"):
+            self.render_tasks()
 
     def update_mood(self) -> None:
         if self.state.get("mood_frozen"):
@@ -364,6 +514,7 @@ class PetWidget(QWidget):
         self.roll_over_day_if_needed()
         self.update_mood()
         self.refresh_view()
+        self.update_time_left_labels()
         self.save_state()
 
     def refresh_view(self) -> None:
@@ -392,6 +543,7 @@ class PetWidget(QWidget):
             item = self.task_list_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
+        self.task_rows = {}
 
         tasks = self.state["tasks"]
         if not tasks:
@@ -403,7 +555,14 @@ class PetWidget(QWidget):
             row.complete_requested.connect(self.confirm_task)
             row.remove_requested.connect(self.remove_task)
             self.task_list_layout.addWidget(row)
+            self.task_rows[task["id"]] = row
         self.task_list_layout.addStretch(1)
+
+    def update_time_left_labels(self) -> None:
+        for task in self.state["tasks"]:
+            row = self.task_rows.get(task["id"])
+            if row is not None:
+                row.update_time_left(task)
 
     def add_task(self) -> None:
         title = self.task_input.text().strip()
@@ -412,10 +571,13 @@ class PetWidget(QWidget):
             return
 
         self.update_mood()
+        duration = self.duration_input.value()
+        due = datetime.now() + timedelta(minutes=duration)
         self.state["tasks"].append({
             "id": str(uuid.uuid4()),
             "title": title,
-            "deadline": self.deadline_input.time().toString("HH:mm"),
+            "duration_minutes": duration,
+            "due_at": due.isoformat(timespec="seconds"),
             "done": False,
         })
         self.state["mood_frozen"] = False
@@ -431,17 +593,70 @@ class PetWidget(QWidget):
         if not task or task.get("done"):
             return
 
-        answer = QMessageBox.question(
-            self,
-            "Confirm task",
-            f"Have you completed this task?\n\n{task['title']}",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
+        if self.confirm_dialog is not None:
+            self.confirm_dialog.raise_()
+            self.confirm_dialog.activateWindow()
+            return
+
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Confirm task")
+        dialog.setText(f"Have you completed this task?\n\n{task['title']}")
+        dialog.setStyleSheet(self.styleSheet())
+        dialog.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
+        dialog.setDefaultButton(QMessageBox.StandardButton.No)
+        dialog.buttonClicked.connect(
+            lambda button, active=dialog, active_task_id=task_id:
+                self.handle_task_confirmation(active, active_task_id, button)
+        )
+        self.show_task_dialog(dialog)
+
+    def show_task_dialog(self, dialog: QMessageBox) -> None:
+        dialog.setWindowModality(Qt.WindowModality.NonModal)
+        dialog.setWindowFlags(
+            dialog.windowFlags() | Qt.WindowType.WindowStaysOnTopHint
+        )
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.confirm_dialog = dialog
+        dialog.finished.connect(
+            lambda _result, active=dialog: self.clear_confirm_dialog(active)
+        )
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def show_not_yet_message(self) -> None:
+        if self.confirm_dialog is not None:
+            return
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Not yet")
+        dialog.setText("Come back when you finish the task.")
+        dialog.setStyleSheet(self.styleSheet())
+        dialog.setStandardButtons(QMessageBox.StandardButton.Ok)
+        dialog.setDefaultButton(QMessageBox.StandardButton.Ok)
+        self.show_task_dialog(dialog)
+
+    def handle_task_confirmation(self, dialog, task_id: str, button) -> None:
+        answer = dialog.standardButton(button)
         if answer == QMessageBox.StandardButton.No:
-            QMessageBox.information(
-                self, "Not yet", "Come back when you finish the task."
-            )
+            self.confirm_dialog = None
+            dialog.close()
+            QTimer.singleShot(0, self.show_not_yet_message)
+            return
+        if answer == QMessageBox.StandardButton.Yes:
+            dialog.close()
+            self.mark_task_complete(task_id)
+        elif answer == QMessageBox.StandardButton.Ok:
+            dialog.close()
+
+    def clear_confirm_dialog(self, dialog) -> None:
+        if self.confirm_dialog is dialog:
+            self.confirm_dialog = None
+
+    def mark_task_complete(self, task_id: str) -> None:
+        task = next((item for item in self.state["tasks"] if item["id"] == task_id), None)
+        if not task or task.get("done"):
             return
 
         self.update_mood()
@@ -486,6 +701,35 @@ class PetWidget(QWidget):
         self.refresh_view()
         self.save_state()
 
+    def toggle_theme(self) -> None:
+        self.state["theme"] = "dark" if self.state["theme"] == "light" else "light"
+        self.apply_theme()
+        self.save_state()
+
+    def apply_theme(self) -> None:
+        self.setStyleSheet(build_stylesheet(THEMES[self.state["theme"]]))
+        if self.state["theme"] == "light":
+            self.theme_button.setText("☾")
+            self.theme_button.setToolTip("Switch to dark mode")
+        else:
+            self.theme_button.setText("☀")
+            self.theme_button.setToolTip("Switch to light mode")
+        if self.confirm_dialog is not None:
+            self.confirm_dialog.setStyleSheet(self.styleSheet())
+
+    def toggle_collapsed(self) -> None:
+        self.state["collapsed"] = not self.state["collapsed"]
+        self.apply_collapsed()
+        self.save_state()
+
+    def apply_collapsed(self) -> None:
+        collapsed = self.state["collapsed"]
+        self.body.setVisible(not collapsed)
+        self.minimize_button.setText("+" if collapsed else "–")
+        self.minimize_button.setToolTip("Expand" if collapsed else "Minimize")
+        # Let the layout settle, then shrink or grow the window to fit.
+        QTimer.singleShot(0, self.adjustSize)
+
     @staticmethod
     def is_packaged_windows() -> bool:
         return sys.platform == "win32" and bool(getattr(sys, "frozen", False))
@@ -528,24 +772,29 @@ class PetWidget(QWidget):
         self.update_mood()
         self.save_state()
         super().closeEvent(event)
+        if event.isAccepted():
+            QApplication.quit()
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    # Tool windows should remain open when a child dialog closes.
+    app.setQuitOnLastWindowClosed(False)
     app.setOrganizationName("WilsonDogSelfHelp")
     app.setApplicationName("Wilson")
 
-    app_data = Path(QStandardPaths.writableLocation(
-        QStandardPaths.StandardLocation.AppDataLocation
-    ))
-    app_data.mkdir(parents=True, exist_ok=True)
-    instance_lock = QLockFile(str(app_data / "instance.lock"))
-    if not instance_lock.tryLock(0):
-        QMessageBox.information(
-            None,
-            "Wilson is already running",
-            "Only one copy of Wilson can run at a time.",
-        )
+    instance_mutex = acquire_instance_mutex()
+    if instance_mutex is None:
+        notice = QMessageBox()
+        notice.setWindowTitle("Wilson is already running")
+        notice.setText("Only one copy of Wilson can run at a time.")
+        notice.setStyleSheet("""
+            QMessageBox { background: #fffaf0; color: #332d27; }
+            QMessageBox QLabel { background: transparent; color: #332d27; }
+            QMessageBox QPushButton { background: #e9a86c; color: #30251c;
+                                     min-width: 78px; padding: 7px 10px; }
+        """)
+        notice.exec()
         sys.exit(0)
 
     widget = PetWidget()
